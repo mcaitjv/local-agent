@@ -1,0 +1,1 @@
+Gym schedule: Monday, Wednesday, Friday at 7am. Focus on legs on Wednesday.

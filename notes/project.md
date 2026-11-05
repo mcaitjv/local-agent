@@ -1,0 +1,1 @@
+Project deadline is December 15. The client is Acme Corp and the budget is 40,000 TL.
