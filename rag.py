@@ -1,49 +1,74 @@
-"""Tiny RAG: embed note chunks, then find the ones closest in meaning to a query.
+# =============================================================================
+# rag.py  —  RAG (Retrieval-Augmented Generation) in ~60 lines
+#
+# Problem: you can't paste ALL your notes into the model every time; it would
+# overflow the context window. RAG finds only the RELEVANT pieces and gives
+# just those to the model.
+#
+# How:
+#   1. Split each note into chunks (here: one paragraph = one chunk).
+#   2. An EMBEDDING MODEL turns each chunk into a vector (a list of ~768
+#      numbers). Texts with similar MEANING get vectors pointing in similar
+#      directions.
+#   3. When a question comes in, turn the question into a vector too.
+#   4. Compare the question vector with every chunk vector (cosine similarity)
+#      and return the closest ones.
+#
+# No vector database on purpose. A vector DB (Chroma, Qdrant...) does exactly
+# this, just faster and for millions of chunks.
+# =============================================================================
 
-No vector database on purpose -- just lists of numbers and cosine similarity,
-so you can see exactly what a vector DB does under the hood.
-"""
 import os
 import math
 import ollama
 
-# ---------- SETTINGS ----------
-# Which embedding model turns text into vectors, and where your notes live.
-# _index is the in-memory "vector database": every paragraph of every note,
-# stored together with its vector so it can be compared to a query later.
+
+# -----------------------------------------------------------------------------
+# SETTINGS
+# EMBED_MODEL is a different, much smaller model than qwen. It doesn't chat;
+# it only converts text into vectors.
+# MIN_SCORE: chunks scoring below this are thrown away as "not relevant".
+# -----------------------------------------------------------------------------
 EMBED_MODEL = "nomic-embed-text"
-NOTES_DIR = os.path.abspath("notes")
+# The notes folder next to THIS file (not "wherever the program was started"),
+# so search works no matter which app or folder launches the server.
+NOTES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes")
+MIN_SCORE = 0.6
+TOP_K = 3   # at most this many chunks are returned
 
-_index = []  # list of {"source": filename, "text": chunk, "vector": [...]}
+# The index: lives in memory (RAM) while the program runs.
+# Each item looks like: {"source": "project.md", "text": "...", "vector": [0.01, -0.3, ...]}
+_index = []
 
 
-# ---------- _chunks ----------
-# Splits a note into paragraphs (separated by blank lines).
-# Each paragraph becomes one searchable piece, so a search returns the
-# relevant paragraph instead of the whole file.
+# -----------------------------------------------------------------------------
+# CHUNKING
+# Splits a note on blank lines, so every paragraph becomes its own chunk.
+# Smaller chunks = more precise matches, but less context in each one.
+# Real systems tune this a lot (fixed sizes, overlap between chunks, etc.).
+# -----------------------------------------------------------------------------
 def _chunks(text: str):
-    """Split a note into paragraphs (one chunk per paragraph)."""
     return [p.strip() for p in text.split("\n\n") if p.strip()]
 
 
-# ---------- _cosine ----------
-# Measures how similar two vectors are, giving a score near 1 when two
-# texts mean nearly the same thing and near 0 when they are unrelated.
-# This is the comparison a vector database does for you.
+# -----------------------------------------------------------------------------
+# COSINE SIMILARITY
+# Measures how much two vectors point in the same direction.
+#   1.0 = same meaning,  ~0 = unrelated.
+# Formula: (a · b) / (|a| * |b|)
+# -----------------------------------------------------------------------------
 def _cosine(a, b):
     dot = sum(x * y for x, y in zip(a, b))
     return dot / (math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b)))
 
 
-# ---------- build_index ----------
-# Prepares the notes for searching:
-#   1. read every .md / .txt file in notes/
-#   2. split each file into paragraphs
-#   3. send the paragraphs to the embedding model to get one vector each
-#   4. store (file name, paragraph, vector) in _index
-# Runs once; after that searches only need to embed the query.
+# -----------------------------------------------------------------------------
+# BUILD THE INDEX
+# Reads every .md/.txt file in notes/, chunks it, embeds every chunk, and
+# stores the result in _index. Called at startup and after every write
+# (from agent.py), so the search always matches what's on disk.
+# -----------------------------------------------------------------------------
 def build_index():
-    """Read every .md/.txt file in notes/ and embed each chunk."""
     _index.clear()
     if not os.path.isdir(NOTES_DIR):
         return
@@ -54,22 +79,24 @@ def build_index():
             pieces = _chunks(f.read())
         if not pieces:
             continue
-        # nomic-embed-text expects a task prefix
+        # nomic-embed-text was trained with prefixes: "search_document: "
+        # for stored text and "search_query: " for questions. Using them
+        # noticeably improves matching. (Other embedding models may not need them.)
         vectors = ollama.embed(model=EMBED_MODEL, input=[f"search_document: {p}" for p in pieces]).embeddings
         for text, vec in zip(pieces, vectors):
             _index.append({"source": name, "text": text, "vector": vec})
     print(f"📚 indexed {len(_index)} chunks from {NOTES_DIR}")
 
 
-# ---------- search_notes ----------
-# Finds the paragraphs that best match a question:
-#   1. build the index if it hasn't been built yet
-#   2. turn the question into a vector
-#   3. score every stored paragraph against it with _cosine and sort best-first
-#   4. keep at most the top 3, and only those scoring 0.6 or higher
-#   5. return them as text, each labeled with its file name
-# agent.py gives this function to the model as a tool, so the docstring
-# below is what tells the model when and how to use it.
+# -----------------------------------------------------------------------------
+# SEARCH (this is the TOOL the agent uses)
+# 1. Build the index if it's empty (first call).
+# 2. Embed the question.
+# 3. Score every chunk, sort from best to worst.
+# 4. Print the top scores so you can watch retrieval happen.
+# 5. Keep only chunks above MIN_SCORE and return them as one text block,
+#    each tagged with its source file so the model can say where it came from.
+# -----------------------------------------------------------------------------
 def search_notes(query: str) -> str:
     """Search the user's personal notes by meaning and return the most relevant passages.
 
@@ -80,22 +107,25 @@ def search_notes(query: str) -> str:
         build_index()
     if not _index:
         return "No notes found."
+
     q_vec = ollama.embed(model=EMBED_MODEL, input=f"search_query: {query}").embeddings[0]
+
     ranked = sorted(((_cosine(q_vec, c["vector"]), c) for c in _index),
                     key=lambda x: x[0], reverse=True)
-    for s, c in ranked[:3]:
-        print(f"   🔎 {s:.3f}  {c['source']}  {'✅' if s >= 0.6 else '❌ dropped'}")
-    scored = [c for s, c in ranked[:3] if s >= 0.6]
+
+    for s, c in ranked[:TOP_K]:
+        print(f"   🔎 {s:.3f}  {c['source']}  {'✅' if s >= MIN_SCORE else '❌ dropped'}")
+
+    scored = [c for s, c in ranked[:TOP_K] if s >= MIN_SCORE]
     if not scored:
         return "No relevant notes found."
     return "\n\n".join(f"[{c['source']}] {c['text']}" for c in scored)
 
 
-
-# ---------- MAIN ----------
-# Only runs when you start this file directly (python rag.py), not when
-# agent.py imports it. Lets you try the search on its own: type a query,
-# see the scores and results; type exit or quit to stop.
+# =============================================================================
+# STANDALONE TEST MODE  —  `python rag.py` lets you try searches directly,
+# without the agent. Useful for tuning MIN_SCORE and testing queries.
+# =============================================================================
 if __name__ == "__main__":
     build_index()
     while True:
